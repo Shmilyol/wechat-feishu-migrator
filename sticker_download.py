@@ -12,8 +12,11 @@ import http.client
 import io
 import json
 import math
+import errno
 import os
 from pathlib import Path
+import socket
+import ssl
 import tempfile
 import threading
 import time
@@ -84,13 +87,53 @@ def _remaining(deadline, cancel=None):
     return remaining
 
 
+def _network_error(error, stage):
+    # URLError.reason normally holds the original socket/SSL exception.
+    # Never stringify it: it may include a signed URL or proxy credentials.
+    for _ in range(4):
+        if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException):
+            error = error.reason
+        else:
+            break
+    winerror = getattr(error, 'winerror', None)
+    code = winerror if isinstance(winerror, int) else getattr(error, 'errno', None)
+    suffix = ''
+    if isinstance(code, int):
+        suffix = f'（{"WinError" if isinstance(winerror, int) else "errno"}={code}）'
+    if isinstance(error, ssl.SSLCertVerificationError):
+        category, message, retryable = 'tls_certificate', 'TLS 证书校验失败', False
+        verify_code = getattr(error, 'verify_code', None)
+        if isinstance(verify_code, int):
+            suffix += f'（verify_code={verify_code}）'
+    elif isinstance(error, ssl.SSLError):
+        category, message, retryable = 'tls', 'TLS 协商或加密连接失败', False
+    elif isinstance(error, socket.gaierror):
+        category, message = 'dns', '域名解析失败（图片服务器或代理地址）'
+        retryable = code in (socket.EAI_AGAIN, 11002)
+    elif isinstance(error, TimeoutError) or code in (errno.ETIMEDOUT, 10060):
+        category, message, retryable = 'timeout', '连接超时' if stage == 'connect' else '接收图片超时', True
+    elif isinstance(error, ConnectionRefusedError) or code in (errno.ECONNREFUSED, 10061):
+        category, message, retryable = 'connection_refused', '连接被拒绝（检查网络及代理是否可用）', False
+    elif isinstance(error, ConnectionResetError) or code in (errno.ECONNRESET, 10054):
+        category, message, retryable = 'connection_reset', '连接被重置', True
+    elif code in (errno.EACCES, 10013):
+        category, message, retryable = 'network_permission', '网络连接被系统拒绝', False
+    elif isinstance(error, (EOFError, http.client.HTTPException)):
+        category, message, retryable = 'response', '图片响应中断或格式异常', True
+    else:
+        category, message, retryable = 'network', '网络连接失败，异常类型 ' + type(error).__name__, True
+    return _DownloadError(f'[{category}/{stage}] {message}{suffix}', retryable)
+
+
 def _fetch(opener, url, timeout, max_bytes, deadline=None, cancel=None):
     _check_url(url)
     if deadline is None:
         deadline = time.monotonic() + timeout
+    stage = 'connect'
     try:
         request = urllib.request.Request(url, headers={'User-Agent': 'StickerMigrator/1'})
         with opener.open(request, timeout=min(timeout, _remaining(deadline, cancel))) as response:
+            stage = 'read'
             _remaining(deadline, cancel)
             _check_url(response.geturl())
             length = response.headers.get('Content-Length')
@@ -122,10 +165,8 @@ def _fetch(opener, url, timeout, max_bytes, deadline=None, cancel=None):
         code = exc.code
         exc.close()
         raise _DownloadError(f'HTTP {code}', code in (408, 429) or 500 <= code < 600) from None
-    except (urllib.error.URLError, TimeoutError, ConnectionError):
-        raise _DownloadError('network error or timeout', retryable=True) from None
-    except (OSError, EOFError, http.client.HTTPException):
-        raise _DownloadError('response read failed', retryable=True) from None
+    except (urllib.error.URLError, OSError, EOFError, http.client.HTTPException) as exc:
+        raise _network_error(exc, stage) from None
     except (ValueError, UnicodeError):
         raise _DownloadError('invalid HTTP(S) URL') from None
 
@@ -312,6 +353,10 @@ def download_stickers(records, output_dir, manifest_path, account='', *,
                 print(message, flush=True)
 
     report(f'共 {len(records)} 个收藏，最多 {workers} 路并发；正在检查已有下载记录……')
+    if progress:
+        proxies = urllib.request.getproxies()
+        proxy_configured = any(proxies.get(scheme) for scheme in ('http', 'https', 'all'))
+        report('网络配置：检测到系统或环境代理配置' if proxy_configured else '网络配置：未检测到代理配置')
     try:
         from PIL import Image
     except ImportError:

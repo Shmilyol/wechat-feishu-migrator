@@ -4,6 +4,8 @@ import hashlib
 import http.client
 import io
 import json
+import socket
+import ssl
 from pathlib import Path
 import tempfile
 import threading
@@ -179,6 +181,51 @@ class DownloadTests(unittest.TestCase):
         paths = self.download(records)
         self.opener.open.assert_called_once()
         self.assertEqual(len(paths), 2)
+
+    def test_network_error_categories_preserve_codes_but_hide_sensitive_text(self):
+        secret = 'https://private.example/image?token=do-not-print'
+        refused = ConnectionRefusedError(10061, secret)
+        refused.winerror = 10061
+        cases = [
+            (urllib.error.URLError(socket.gaierror(11001, secret)), '[dns/connect]', '11001'),
+            (urllib.error.URLError(ssl.SSLCertVerificationError(1, secret)), '[tls_certificate/connect]', None),
+            (urllib.error.URLError(ssl.SSLError(1, secret)), '[tls/connect]', None),
+            (urllib.error.URLError(refused), '[connection_refused/connect]', 'WinError=10061'),
+            (TimeoutError(secret), '[timeout/connect]', None),
+            (ConnectionResetError(10054, secret), '[connection_reset/connect]', '10054'),
+        ]
+        for error, category, code in cases:
+            with self.subTest(category=category):
+                self.opener.open.side_effect = error
+                with self.assertRaises(downloader._DownloadError) as caught:
+                    downloader._fetch(self.opener, 'https://cdn.example/image', 3, 1024)
+                message = str(caught.exception)
+                self.assertIn(category, message)
+                if code:
+                    self.assertIn(code, message)
+                self.assertNotIn('do-not-print', message)
+                self.assertNotIn('private.example', message)
+
+    def test_proxy_progress_never_exposes_proxy_address_or_credentials(self):
+        output = io.StringIO()
+        self.opener.open.return_value = Response(image_bytes())
+        with patch.object(downloader.urllib.request, 'getproxies',
+                          return_value={'https': 'http://user:private-password@proxy.private:8080'}), \
+                contextlib.redirect_stdout(output):
+            self.download([self.record()], progress=True)
+        self.assertIn('检测到系统或环境代理配置', output.getvalue())
+        self.assertNotIn('private-password', output.getvalue())
+        self.assertNotIn('proxy.private', output.getvalue())
+
+    def test_response_timeout_is_distinguished_from_connection_timeout(self):
+        response = Response(image_bytes())
+        response.read = lambda size: (_ for _ in ()).throw(TimeoutError('private-token'))
+        self.opener.open.return_value = response
+        with self.assertRaises(downloader._DownloadError) as caught:
+            downloader._fetch(self.opener, 'https://cdn.example/image', 3, 1024)
+        self.assertIn('[timeout/read]', str(caught.exception))
+        self.assertNotIn('private-token', str(caught.exception))
+        self.assertTrue(response.closed)
 
     def test_real_formats_animations_and_misleading_content_type(self):
         for fmt, animated, suffix in [('PNG', False, '.png'), ('GIF', True, '.gif'),
