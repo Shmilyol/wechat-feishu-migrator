@@ -1,10 +1,12 @@
 """Offline tests: synthetic Pillow images and mocked urllib HTTP responses only."""
+import contextlib
 import hashlib
 import http.client
 import io
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -28,6 +30,9 @@ class Response(io.BytesIO):
     def read(self, size=-1):
         self.read_sizes.append(size)
         return super().read(size)
+
+    def read1(self, size=-1):
+        return self.read(size)
 
 
 def image_bytes(fmt='PNG', animated=False, color='red'):
@@ -60,13 +65,120 @@ class DownloadTests(unittest.TestCase):
         self.addCleanup(network_patch.stop)
 
     def download(self, records, **kwargs):
-        return downloader.download_stickers(records, self.output, self.manifest, **kwargs)
+        options = {'workers': 1, 'progress': False, **kwargs}
+        return downloader.download_stickers(records, self.output, self.manifest, **options)
 
     def entries(self):
         return list(json.loads(self.manifest.read_text(encoding='utf-8'))['records'].values())
 
     def record(self, identity='one', urls=None):
         return {'id': identity, 'urls': ['https://cdn.example/image'] if urls is None else urls}
+
+    def test_progress_is_visible_before_waiting_for_network(self):
+        output = io.StringIO()
+        data = image_bytes()
+
+        def open_response(*args, **kwargs):
+            self.assertIn('[1/1]', output.getvalue())
+            return Response(data)
+
+        self.opener.open.side_effect = open_response
+        with contextlib.redirect_stdout(output):
+            self.download([self.record()], progress=True)
+        self.assertIn('完成', output.getvalue())
+
+    def test_slow_continuous_response_cannot_exceed_item_budget(self):
+        clock = [0.0]
+        data = image_bytes()
+
+        class SlowResponse(Response):
+            def read(self, size=-1):
+                # Bytes keep arriving before each socket timeout, for >60 s total.
+                clock[0] += 2
+                return super().read(min(size, 1))
+
+        self.opener.open.return_value = SlowResponse(data)
+        with patch.object(downloader.time, 'monotonic', side_effect=lambda: clock[0]):
+            with self.assertRaisesRegex(RuntimeError, 'time budget'):
+                self.download([self.record()], timeout=3, retries=0)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(self.entries()[0]['status'], 'failed')
+        self.assertLessEqual(clock[0], 65)
+
+    def test_parallel_downloads_are_bounded_ordered_and_checkpointed_on_main_thread(self):
+        first_started, second_started = threading.Event(), threading.Event()
+        lock = threading.Lock()
+        active, maximum = [0], [0]
+        main_thread = threading.get_ident()
+        payloads = {f'https://cdn.example/{i}': image_bytes(color=color)
+                    for i, color in enumerate(('red', 'green', 'blue'))}
+
+        class TrackedResponse(Response):
+            def __exit__(self, *args):
+                try:
+                    return super().__exit__(*args)
+                finally:
+                    with lock:
+                        active[0] -= 1
+
+        def open_response(request, **kwargs):
+            with lock:
+                active[0] += 1
+                maximum[0] = max(maximum[0], active[0])
+            url = request.full_url
+            if url.endswith('/0'):
+                first_started.set()
+                self.assertTrue(second_started.wait(2), 'second download never ran concurrently')
+            elif url.endswith('/1'):
+                self.assertTrue(first_started.wait(2))
+                second_started.set()
+            return TrackedResponse(payloads[url])
+
+        write = downloader._atomic_write
+        def checkpoint(path, data):
+            self.assertEqual(threading.get_ident(), main_thread)
+            return write(path, data)
+
+        records = [self.record(str(i), [url]) for i, url in enumerate(payloads)]
+        self.opener.open.side_effect = open_response
+        with patch.object(downloader, '_atomic_write', side_effect=checkpoint):
+            paths = self.download(records, workers=2)
+        self.assertEqual(maximum[0], 2)
+        self.assertEqual(active[0], 0)
+        self.assertEqual([p.read_bytes() for p in paths], list(payloads.values()))
+        self.assertEqual(len(self.entries()), 3)
+        self.assertTrue(all(e['status'] == 'success' for e in self.entries()))
+
+    def test_parallel_duplicate_ids_share_one_network_job(self):
+        self.opener.open.return_value = Response(image_bytes())
+        paths = self.download([self.record(), self.record()], workers=4)
+        self.assertEqual(paths[0], paths[1])
+        self.opener.open.assert_called_once()
+
+    def test_budget_is_shared_across_candidate_urls(self):
+        clock = [0.0]
+        def unavailable(*args, **kwargs):
+            clock[0] += 10
+            raise TimeoutError('private URL must not appear')
+        self.opener.open.side_effect = unavailable
+        urls = [f'https://cdn.example/{i}' for i in range(10)]
+        with patch.object(downloader.time, 'monotonic', side_effect=lambda: clock[0]):
+            with self.assertRaisesRegex(RuntimeError, 'time budget'):
+                self.download([self.record(urls=urls)], item_timeout=20, retries=0)
+        self.assertEqual(self.opener.open.call_count, 2)
+
+    def test_interruption_keeps_completed_checkpoints_for_resume(self):
+        self.opener.open.side_effect = [Response(image_bytes()), KeyboardInterrupt()]
+        records = [self.record('done'), self.record('interrupted')]
+        with self.assertRaises(KeyboardInterrupt):
+            self.download(records)
+        self.assertEqual(len(self.entries()), 1)
+        self.assertEqual(self.entries()[0]['status'], 'success')
+        self.opener.open.reset_mock(side_effect=True)
+        self.opener.open.return_value = Response(image_bytes(color='green'))
+        paths = self.download(records)
+        self.opener.open.assert_called_once()
+        self.assertEqual(len(paths), 2)
 
     def test_real_formats_animations_and_misleading_content_type(self):
         for fmt, animated, suffix in [('PNG', False, '.png'), ('GIF', True, '.gif'),
@@ -372,7 +484,10 @@ class DownloadTests(unittest.TestCase):
                    {'records': [{'id': 'x', 'urls': [None]}]}, {'account': None},
                    {'max_bytes': 0}, {'max_bytes': True}, {'timeout': 0},
                    {'timeout': float('inf')}, {'timeout': float('nan')}, {'timeout': True},
-                   {'retries': -1}, {'retries': 11}, {'retries': True}]
+                   {'retries': -1}, {'retries': 11}, {'retries': True},
+                   {'workers': 0}, {'workers': 9}, {'workers': True},
+                   {'item_timeout': 0}, {'item_timeout': float('inf')},
+                   {'item_timeout': True}, {'progress': 'yes'}]
         for kwargs in invalid:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 self.download(**dict({'records': [self.record()]}, **kwargs))

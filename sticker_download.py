@@ -5,6 +5,8 @@ The manifest is version 1, with a ``records`` mapping keyed by the SHA-256 of
 JSON [account, id]. Unrelated manifest fields and records survive each update.
 Calls sharing a manifest must be serialized by the caller.
 """
+from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import closing
 import hashlib
 import http.client
 import io
@@ -13,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -72,11 +75,23 @@ def _image_format(data, Image):
         raise _DownloadError('invalid image data') from None
 
 
-def _fetch(opener, url, timeout, max_bytes):
+def _remaining(deadline, cancel=None):
+    if cancel is not None and cancel.is_set():
+        raise CancelledError
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _DownloadError('item network time budget exceeded')
+    return remaining
+
+
+def _fetch(opener, url, timeout, max_bytes, deadline=None, cancel=None):
     _check_url(url)
+    if deadline is None:
+        deadline = time.monotonic() + timeout
     try:
         request = urllib.request.Request(url, headers={'User-Agent': 'StickerMigrator/1'})
-        with opener.open(request, timeout=timeout) as response:
+        with opener.open(request, timeout=min(timeout, _remaining(deadline, cancel))) as response:
+            _remaining(deadline, cancel)
             _check_url(response.geturl())
             length = response.headers.get('Content-Length')
             try:
@@ -87,8 +102,13 @@ def _fetch(opener, url, timeout, max_bytes):
                 raise _DownloadError('image exceeds size limit')
             chunks = []
             size = 0
+            # HTTPResponse.read() may wait to fill the whole block despite a trickle.
+            # read1() returns after at most one underlying read, so deadlines are checked.
+            read = getattr(response, 'read1', response.read)
             while True:
-                chunk = response.read(min(65536, max_bytes - size + 1))
+                _remaining(deadline, cancel)
+                chunk = read(min(65536, max_bytes - size + 1))
+                _remaining(deadline, cancel)
                 if not chunk:
                     break
                 size += len(chunk)
@@ -172,14 +192,88 @@ def _cached_file(entry, output_dir, max_bytes, Image):
         return None
 
 
+def _download_one(job, total, timeout, max_bytes, retries, item_timeout, Image, report, cancel):
+    index, record, _, _ = job
+    label = f'[{index}/{total}]'
+    report(f'{label} 开始下载')
+    deadline = time.monotonic() + item_timeout
+    opener = urllib.request.build_opener(_HTTPRedirects())
+    errors = []
+    try:
+        for candidate, url in enumerate(record['urls']):
+            for attempt in range(retries + 1):
+                _remaining(deadline, cancel)
+                report(f'{label} 请求资源 {candidate + 1}/{len(record["urls"])}，第 {attempt + 1} 次尝试')
+                try:
+                    data = _fetch(opener, url, timeout, max_bytes, deadline, cancel)
+                    fmt = _image_format(data, Image)
+                    return (data, fmt, hashlib.sha256(data).hexdigest(), url), errors
+                except _DownloadError as exc:
+                    errors.append({'candidate': candidate, 'attempt': attempt + 1, 'error': str(exc)})
+                    report(f'{label} 本次请求失败：{exc}')
+                    _remaining(deadline, cancel)
+                    if not exc.retryable or attempt == retries:
+                        break
+                    time.sleep(min(0.25 * (2 ** attempt), 2, _remaining(deadline, cancel)))
+        return None, errors
+    except _DownloadError as exc:
+        errors.append({'error': str(exc)})
+        return None, errors
+
+
+def _completed_downloads(jobs, total, workers, timeout, max_bytes, retries,
+                         item_timeout, Image, report):
+    cancel = threading.Event()
+    arguments = (total, timeout, max_bytes, retries, item_timeout, Image, report, cancel)
+    if workers == 1:
+        for job in jobs:
+            yield job, _download_one(job, *arguments)
+        return
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='sticker-download')
+    pending = {}
+    remaining_jobs = iter(jobs)
+
+    def submit_next():
+        job = next(remaining_jobs, None)
+        if job is not None:
+            pending[executor.submit(_download_one, job, *arguments)] = job
+
+    try:
+        for _ in range(min(workers, len(jobs))):
+            submit_next()
+        last_report = time.monotonic()
+        while pending:
+            done, _ = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+            if not done and time.monotonic() - last_report >= 5:
+                indices = ', '.join(str(job[0]) for job in pending.values())
+                report(f'仍在处理第 {indices} 张（等待网络或校验），可按 Ctrl+C 停止')
+                last_report = time.monotonic()
+            for future in done:
+                job = pending.pop(future)
+                yield job, future.result()
+                submit_next()
+    finally:
+        cancel.set()
+        for future in pending:
+            future.cancel()
+        # Running urllib operations stop at their socket timeout; no background writes.
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
 def download_stickers(records, output_dir, manifest_path, account='', *,
-                      max_bytes=25 * 1024 * 1024, timeout=20, retries=2) -> list[Path]:
+                      max_bytes=25 * 1024 * 1024, timeout=10, retries=2,
+                      workers=4, item_timeout=60, progress=True) -> list[Path]:
     """Return one Path per input record, in order (duplicates share a Path).
 
     ``records`` is a list of {"id": str, "urls": list[str]}. Candidate URLs are
     tried in order; transient transport failures get ``retries`` extra attempts
     per URL (0..10). Each urllib operation uses ``timeout`` seconds. The default
     per-image limit is 25 MiB, also enforced when Content-Length is absent.
+    At most ``workers`` downloads run concurrently (default 4, maximum 8).
+    ``item_timeout`` is a shared network budget across a record's candidates and
+    retries, checked before/after blocking operations. A blocking socket call can
+    exceed the remaining budget by its timeout; DNS, TLS/redirect handling and
+    image decoding are not forcibly interrupted. Progress is flushed to stdout.
 
     Each successful or failed record is checkpointed immediately. Cache hits are
     rehashed and decoded; equal SHA-256 payloads reuse one file across records
@@ -202,19 +296,33 @@ def download_stickers(records, output_dir, manifest_path, account='', *,
             or isinstance(timeout, bool) or not isinstance(timeout, (int, float))
             or not math.isfinite(timeout) or timeout <= 0):
         raise ValueError('max_bytes and timeout must be positive; retries must be an integer from 0 to 10')
+    if (type(workers) is not int or not 1 <= workers <= 8
+            or isinstance(item_timeout, bool) or not isinstance(item_timeout, (int, float))
+            or not math.isfinite(item_timeout) or item_timeout <= 0
+            or type(progress) is not bool):
+        raise ValueError('workers must be 1..8; item_timeout must be positive; progress must be boolean')
     output_dir = Path(output_dir).resolve()
     manifest_path = Path(manifest_path).resolve()
     manifest = _load_manifest(manifest_path)
+    console_lock = threading.Lock()
+
+    def report(message):
+        if progress:
+            with console_lock:
+                print(message, flush=True)
+
+    report(f'共 {len(records)} 个收藏，最多 {workers} 路并发；正在检查已有下载记录……')
     try:
         from PIL import Image
     except ImportError:
         raise RuntimeError('Pillow is required to validate downloaded stickers') from None
 
-    opener = urllib.request.build_opener(_HTTPRedirects())
     # Verify each distinct path only once per call; never trust manifest hashes.
     checked = {}
     by_hash = {}
-    for entry in manifest['records'].values():
+    for cache_index, entry in enumerate(manifest['records'].values(), 1):
+        if cache_index % 10 == 0:
+            report(f'缓存检查 {cache_index}/{len(manifest["records"])}')
         if entry.get('status') != 'success':
             continue
         signature = (entry.get('path'), entry.get('sha256'), entry.get('size'), entry.get('format'))
@@ -227,12 +335,16 @@ def download_stickers(records, output_dir, manifest_path, account='', *,
         if path is not None:
             by_hash[entry['sha256']] = path
 
-    paths = []
+    paths_by_key, identities, jobs, scheduled = {}, [], [], set()
     failures = []
-    for record in records:
+    for index, record in enumerate(records, 1):
         sticker_id = record['id']
         identity = json.dumps([account, sticker_id], ensure_ascii=False, separators=(',', ':'))
         key = hashlib.sha256(identity.encode('utf-8')).hexdigest()
+        identities.append(key)
+        if key in scheduled:
+            continue
+        scheduled.add(key)
         previous = manifest['records'].get(key, {})
         signature = (previous.get('path'), previous.get('sha256'), previous.get('size'), previous.get('format'))
         try:
@@ -240,27 +352,16 @@ def download_stickers(records, output_dir, manifest_path, account='', *,
         except TypeError:
             cached = None
         if cached is not None and previous.get('account') == account and previous.get('id') == sticker_id:
-            paths.append(cached)
-            continue
+            paths_by_key[key] = cached
+            report(f'[{index}/{len(records)}] 已缓存，复用本地图片')
+        else:
+            jobs.append((index, record, key, previous))
 
-        errors = []
-        result = None
-        for candidate, url in enumerate(record['urls']):
-            for attempt in range(retries + 1):
-                try:
-                    data = _fetch(opener, url, timeout, max_bytes)
-                    fmt = _image_format(data, Image)
-                    digest = hashlib.sha256(data).hexdigest()
-                    result = (data, fmt, digest, url)
-                    break
-                except _DownloadError as exc:
-                    errors.append({'candidate': candidate, 'attempt': attempt + 1, 'error': str(exc)})
-                    if not exc.retryable or attempt == retries:
-                        break
-                    time.sleep(min(0.25 * (2 ** attempt), 2))
-            if result is not None:
-                break
-
+    def checkpoint(job, outcome):
+        nonlocal manifest
+        index, record, key, previous = job
+        result, errors = outcome
+        sticker_id = record['id']
         entry = dict(previous, account=account, id=sticker_id)
         created = None
         if result is not None:
@@ -294,11 +395,20 @@ def download_stickers(records, output_dir, manifest_path, account='', *,
             raise
         if result is None:
             failures.append((key, entry['errors'][-1]['error']))
+            report(f'[{index}/{len(records)}] 失败，记录已保存：{entry["errors"][-1]["error"]}')
         else:
             by_hash[digest] = path
             checked[(path.name, digest, len(data), fmt)] = path
-            paths.append(path)
+            paths_by_key[key] = path
+            report(f'[{index}/{len(records)}] 完成，{len(data) / 1024:.1f} KiB，进度已保存')
+
+    with closing(_completed_downloads(jobs, len(records), workers, timeout, max_bytes,
+                                      retries, item_timeout, Image, report)) as completed:
+        for job, outcome in completed:
+            checkpoint(job, outcome)
     if failures:
+        report(f'本轮结束：{len(failures)} 条失败，成功记录已保留，可重新运行重试失败项。')
         detail = '; '.join(f'{key[:12]}: {reason}' for key, reason in failures)
         raise RuntimeError(f'{len(failures)} sticker record(s) failed; successful downloads were preserved: {detail}')
-    return paths
+    report(f'下载完成：{len(records)} 条记录，{len(set(paths_by_key.values()))} 个图片文件。')
+    return [paths_by_key[key] for key in identities]
