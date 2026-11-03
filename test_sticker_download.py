@@ -217,6 +217,98 @@ class DownloadTests(unittest.TestCase):
         self.assertNotIn('private-password', output.getvalue())
         self.assertNotIn('proxy.private', output.getvalue())
 
+    def test_certificate_code_62_is_reported_as_hostname_mismatch(self):
+        error = ssl.SSLCertVerificationError(1, 'signed-url?token=private')
+        error.verify_code = 62
+        self.opener.open.side_effect = urllib.error.URLError(error)
+        with self.assertRaises(downloader._DownloadError) as caught:
+            downloader._fetch(self.opener, 'https://cdn.example/image', 3, 1024)
+        self.assertIn('域名不匹配', str(caught.exception))
+        self.assertIn('verify_code=62', str(caught.exception))
+        self.assertFalse(caught.exception.retryable)
+        self.assertNotIn('private', str(caught.exception))
+
+    def test_cdn_alias_recovers_hostname_mismatch_without_disabling_tls(self):
+        from wechat_source import url_candidates
+        original = 'https://vweixinf.tc.qq.com/stodownload?m=abc&filekey=keep%2Fsignature'
+        alias = 'https://wxapp.tc.qq.com/stodownload?m=abc&filekey=keep%2Fsignature'
+        error = ssl.SSLCertVerificationError(1, 'hostname mismatch')
+        error.verify_code = 62
+        self.opener.open.side_effect = [urllib.error.URLError(error), Response(image_bytes(), url=alias)]
+        paths = self.download([self.record(urls=url_candidates(original))])
+        self.assertEqual([call.args[0].full_url for call in self.opener.open.call_args_list],
+                         [original, alias])
+        self.assertTrue(paths[0].exists())
+        self.sleep.assert_not_called()
+
+    def test_progress_shows_origin_without_path_or_query_tokens(self):
+        output = io.StringIO()
+        self.opener.open.return_value = Response(image_bytes())
+        url = 'https://cdn.example/private-path?filekey=private-token'
+        with contextlib.redirect_stdout(output):
+            self.download([self.record(urls=[url])], progress=True)
+        self.assertIn('目标 https://cdn.example', output.getvalue())
+        self.assertNotIn('private-path', output.getvalue())
+        self.assertNotIn('private-token', output.getvalue())
+        self.assertEqual(downloader._safe_origin('https://user:secret@host.example/image'), '无效地址')
+
+    def test_openssl_rejects_hostname_mismatch_with_verification_enabled(self):
+        # A real in-memory TLS handshake: no sockets and no disabled verification.
+        from datetime import datetime, timedelta, timezone
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.x509.oid import NameOID
+
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'valid.example.test')])
+        now = datetime.now(timezone.utc)
+        certificate = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False,
+                key_encipherment=False, data_encipherment=False, key_agreement=False,
+                key_cert_sign=True, crl_sign=True, encipher_only=None, decipher_only=None), critical=True)
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName('valid.example.test')]), critical=False)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+            .sign(key, hashes.SHA256()))
+        pem = certificate.public_bytes(serialization.Encoding.PEM)
+        certificate_path, key_path = self.root / 'tls.pem', self.root / 'tls.key'
+        certificate_path.write_bytes(pem)
+        key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+        client_context = ssl.create_default_context(cadata=pem.decode('ascii'))
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(certificate_path, key_path)
+        client_in, client_out, server_in, server_out = (ssl.MemoryBIO() for _ in range(4))
+        client = client_context.wrap_bio(client_in, client_out, server_hostname='wrong.example.test')
+        server = server_context.wrap_bio(server_in, server_out, server_side=True)
+        caught = None
+        for _ in range(10):
+            try:
+                client.do_handshake()
+            except ssl.SSLWantReadError:
+                pass
+            except ssl.SSLCertVerificationError as error:
+                caught = error
+                break
+            data = client_out.read()
+            if data:
+                server_in.write(data)
+            try:
+                server.do_handshake()
+            except ssl.SSLWantReadError:
+                pass
+            data = server_out.read()
+            if data:
+                client_in.write(data)
+        self.assertIsNotNone(caught, 'TLS accepted a certificate for a different hostname')
+        self.assertEqual(caught.verify_code, 62)
+        self.assertTrue(client_context.check_hostname)
+        self.assertEqual(client_context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertIn('域名不匹配', str(downloader._network_error(caught, 'connect')))
+
     def test_response_timeout_is_distinguished_from_connection_timeout(self):
         response = Response(image_bytes())
         response.read = lambda size: (_ for _ in ()).throw(TimeoutError('private-token'))

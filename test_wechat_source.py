@@ -162,8 +162,28 @@ class SourceTests(unittest.TestCase):
 
     def test_url_extension_is_before_query_and_ampersand_decoded(self):
         urls = source.url_candidates('http://example.com/stodownload?m=abc&amp;key=1')
-        self.assertEqual(urls[0], 'https://example.com/stodownload?m=abc&key=1')
-        self.assertIn('https://example.com/stodownload.gif?m=abc&key=1', urls)
+        self.assertEqual(urls[0], 'http://example.com/stodownload?m=abc&key=1')
+        self.assertIn('http://example.com/stodownload.gif?m=abc&key=1', urls)
+
+    def test_known_cdn_alias_preserves_signed_path_and_query(self):
+        url = 'https://vweixinf.tc.qq.com/stodownload?m=abc&filekey=x%2Fy%3D&token=keep'
+        urls = source.url_candidates(url)
+        expected = 'https://wxapp.tc.qq.com/stodownload?m=abc&filekey=x%2Fy%3D&token=keep'
+        self.assertEqual(urls[:2], [url, expected])
+        self.assertTrue(all(value.startswith('https://') for value in urls))
+        self.assertIn('https://wxapp.tc.qq.com/stodownload.gif?m=abc&filekey=x%2Fy%3D&token=keep', urls)
+
+    def test_https_never_downgrades_or_rewrites_arbitrary_host(self):
+        url = 'https://other.example/stodownload?next=vweixinf.tc.qq.com'
+        urls = source.url_candidates(url)
+        self.assertTrue(all(value.startswith('https://other.example/') for value in urls))
+        self.assertNotIn('wxapp.tc.qq.com', ' '.join(urls))
+
+    def test_cdn_alias_does_not_rewrite_nonstandard_ports_or_credentials(self):
+        for url in ('https://vweixinf.tc.qq.com:8443/stodownload?m=1',
+                    'https://user:pass@vweixinf.tc.qq.com/stodownload?m=1'):
+            with self.subTest(url=url):
+                self.assertNotIn('wxapp.tc.qq.com', ' '.join(source.url_candidates(url)))
 
 
 if __name__ == '__main__':

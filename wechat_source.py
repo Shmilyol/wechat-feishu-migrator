@@ -214,13 +214,24 @@ def url_candidates(value):
     urls = []
     for raw in re.findall(r'https?://[^\s<>"\x00]+', value):
         url = raw.replace('&amp;', '&')
-        parts = urlsplit(url)
-        if parts.scheme == 'http':
-            parts = parts._replace(scheme='https')
-        urls.append(urlunsplit(parts))
+        try:
+            parts = urlsplit(url)
+            alias_allowed = (parts.hostname == 'vweixinf.tc.qq.com'
+                             and parts.username is None and parts.password is None
+                             and parts.port in (None, 80 if parts.scheme == 'http' else 443)
+                             and '/stodownload' in parts.path)
+        except ValueError:
+            continue
+        # Preserve the database's protocol; HTTPS support is not implied by HTTP.
+        variants = [parts]
         if '/stodownload' in parts.path:
-            for extension in ('.gif', '.png', '.jpg', '.webp'):
-                urls.append(urlunsplit(parts._replace(path=parts.path + extension)))
+            variants.extend(parts._replace(path=parts.path + extension)
+                            for extension in ('.gif', '.png', '.jpg', '.webp'))
+        for variant in variants:
+            urls.append(urlunsplit(variant))
+            if alias_allowed:
+                # Known WeChat CDN alternative; keep the resource signature intact.
+                urls.append(urlunsplit(variant._replace(netloc='wxapp.tc.qq.com')))
     return list(dict.fromkeys(urls))
 
 

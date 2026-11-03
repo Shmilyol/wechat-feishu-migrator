@@ -105,6 +105,8 @@ def _network_error(error, stage):
         verify_code = getattr(error, 'verify_code', None)
         if isinstance(verify_code, int):
             suffix += f'（verify_code={verify_code}）'
+            if verify_code == 62:
+                message = 'TLS 证书与请求域名不匹配'
     elif isinstance(error, ssl.SSLError):
         category, message, retryable = 'tls', 'TLS 协商或加密连接失败', False
     elif isinstance(error, socket.gaierror):
@@ -233,6 +235,21 @@ def _cached_file(entry, output_dir, max_bytes, Image):
         return None
 
 
+def _safe_origin(url):
+    try:
+        _check_url(url)
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname.encode('idna').decode('ascii')
+        if len(host) > 253:
+            return '无效域名'
+        if ':' in host:
+            host = '[' + host + ']'
+        port = f':{parts.port}' if parts.port is not None else ''
+        return f'{parts.scheme}://{host}{port}'
+    except (ValueError, UnicodeError, _DownloadError):
+        return '无效地址'
+
+
 def _download_one(job, total, timeout, max_bytes, retries, item_timeout, Image, report, cancel):
     index, record, _, _ = job
     label = f'[{index}/{total}]'
@@ -244,7 +261,8 @@ def _download_one(job, total, timeout, max_bytes, retries, item_timeout, Image, 
         for candidate, url in enumerate(record['urls']):
             for attempt in range(retries + 1):
                 _remaining(deadline, cancel)
-                report(f'{label} 请求资源 {candidate + 1}/{len(record["urls"])}，第 {attempt + 1} 次尝试')
+                report(f'{label} 请求资源 {candidate + 1}/{len(record["urls"])}，'
+                       f'第 {attempt + 1} 次尝试，目标 {_safe_origin(url)}')
                 try:
                     data = _fetch(opener, url, timeout, max_bytes, deadline, cancel)
                     fmt = _image_format(data, Image)
