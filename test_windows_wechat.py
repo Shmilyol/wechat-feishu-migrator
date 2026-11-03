@@ -21,6 +21,7 @@ class FakeAPI:
         self.versions = {self.paths[11]: '4.2.0.0'}
         self.denied = set()
         self.arch_x64 = True
+        self.architecture_name = None
         self.opens, self.closed, self.reads = [], [], []
         self.bad_reads = set()
         self.extra_regions = []
@@ -46,6 +47,9 @@ class FakeAPI:
 
     def is_x64(self, handle):
         return self.arch_x64
+
+    def architecture(self, handle):
+        return self.architecture_name or ('x64' if self.is_x64(handle) else 'x86')
 
     def query(self, handle, address):
         for region in self.extra_regions:
@@ -278,6 +282,33 @@ class ScanTests(unittest.TestCase):
         self.assertIn('PID 11', message)
         self.assertEqual(self.api.reads, [])
 
+    def test_native_arm64_reaches_scan_but_rejects_unverified_candidates(self):
+        # The reported device is native ARM64, not an x64 process under emulation.
+        self.api.arch_x64 = False
+        self.api.architecture_name = 'arm64'
+        verifier = Mock(return_value=False)
+        with self.assertRaises(ww.WindowsWechatError) as caught:
+            self.find(verifier)
+        self.assertTrue(self.api.reads, 'native ARM64 was excluded before bounded probing')
+        verifier.assert_called_once_with(self.key)
+        self.assertIn('arm64', str(caught.exception))
+        self.assertNotIn('尚未进入密钥扫描', str(caught.exception))
+
+    def test_failed_scan_reports_counts_without_keys_or_addresses(self):
+        self.api.architecture_name = 'arm64'
+        verifier = Mock(return_value=False)
+        with self.assertRaises(ww.WindowsWechatError) as caught:
+            self.find(verifier)
+        message = str(caught.exception)
+        self.assertIn('PID 11 (arm64)', message)
+        self.assertIn('标记 1', message)
+        self.assertIn('引用 1', message)
+        self.assertIn('对象 1', message)
+        self.assertIn('候选 1', message)
+        self.assertNotIn(self.key.hex(), message)
+        self.assertNotIn(self.salt.hex(), message)
+        self.assertNotIn(hex(ww.MIN_ADDRESS), message)
+
     def test_global_process_byte_budget_includes_graph_and_failed_reads(self):
         reader = ww._Reader(self.api, 11, 8192, float('inf'))
         self.assertIsNone(ww._scan(reader, self.salt, lambda key: False, 128))
@@ -470,6 +501,29 @@ class WinAPITests(unittest.TestCase):
                 api.is_x64(11)
         self.assertIn('IsWow64Process2', str(caught.exception))
         self.assertIn('WinError=6', str(caught.exception))
+
+    def test_architecture_identifies_native_arm64_from_user_report(self):
+        api, kernel, _ = self.make_api()
+
+        def native_arm64(_, process, native):
+            process._obj.value = 0
+            native._obj.value = 0xAA64
+            return 1
+
+        kernel.IsWow64Process2.side_effect = native_arm64
+        self.assertEqual(api.architecture(11), 'arm64')
+        self.assertFalse(api.is_x64(11))
+
+    def test_architecture_preserves_unknown_and_hybrid_machine_types(self):
+        api, kernel, _ = self.make_api()
+        for machine, expected in ((0xA641, 'arm64ec'), (0x014C, 'x86'), (0x1234, 'unknown:0x1234')):
+            with self.subTest(machine=machine):
+                def query(_, process, native):
+                    process._obj.value = machine
+                    native._obj.value = 0xAA64
+                    return 1
+                kernel.IsWow64Process2.side_effect = query
+                self.assertEqual(api.architecture(11), expected)
 
     def test_failed_open_keeps_windows_error_code(self):
         api, kernel, _ = self.make_api()

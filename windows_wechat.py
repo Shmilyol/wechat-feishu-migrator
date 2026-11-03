@@ -4,8 +4,10 @@ This is an independent ctypes implementation, based on format observations in
 https://github.com/liusheng22/export-wechat-emoji/blob/main/cli/src/windows.rs
 and cli/src/keyscan.rs. No upstream implementation is imported or executed.
 
-The observed x64 WCDB layout is a *candidate profile*, not a promise that all
-WeChat 4.x releases use it. Only a caller-supplied database verifier can establish
+The observed WCDB layout is a *candidate profile*, not a promise that all
+WeChat 4.x releases or CPU architectures use it. ARM64 probes this profile
+experimentally; its layout and XOR mask have not been verified on a real device.
+Only a caller-supplied database verifier can establish
 that a 32-byte candidate is the requested database's key. This module never
 prints, saves, or returns unverified candidates. There is no process injection,
 process control, privilege adjustment, or write API.
@@ -40,6 +42,8 @@ MEM_COMMIT = 0x1000
 PAGE_GUARD = 0x100
 READABLE_PROTECTIONS = {0x02, 0x04, 0x08, 0x20, 0x40, 0x80}
 AMD64 = 0x8664
+ARM64 = 0xAA64
+MACHINE_NAMES = {AMD64: 'x64', ARM64: 'arm64', 0x014C: 'x86', 0xA641: 'arm64ec'}
 MIN_ADDRESS = 0x10000
 MAX_ADDRESS = 0x00007FFFFFFFFFFF
 WECHAT_NAMES = frozenset({'weixin.exe', 'wechat.exe'})
@@ -133,7 +137,7 @@ class _WindowsAPI:
         if sys.platform != 'win32':
             raise WindowsWechatError('此功能仅支持 Windows。')
         if ctypes.sizeof(ctypes.c_void_p) != 8:
-            raise WindowsWechatError('请使用 64 位 Python；32 位解释器无法安全扫描 x64 微信。')
+            raise WindowsWechatError('请使用 64 位 Python；32 位解释器无法安全读取 64 位微信。')
         kernel = ctypes.WinDLL('kernel32', use_last_error=True)
         version = ctypes.WinDLL('version', use_last_error=True)
 
@@ -158,7 +162,7 @@ class _WindowsAPI:
             self._machine = bind(kernel, 'IsWow64Process2',
                                  [HANDLE, ctypes.POINTER(WORD), ctypes.POINTER(WORD)], BOOL)
         except AttributeError as exc:
-            raise WindowsWechatError('系统缺少 IsWow64Process2，无法可靠确认微信 x64 架构。') from exc
+            raise WindowsWechatError('系统缺少 IsWow64Process2，无法可靠确认微信进程架构。') from exc
         self._version_size = bind(version, 'GetFileVersionInfoSizeW',
                                   [LPCWSTR, ctypes.POINTER(DWORD)], DWORD)
         self._version_info = bind(version, 'GetFileVersionInfoW',
@@ -222,11 +226,16 @@ class _WindowsAPI:
         return '{}.{}.{}.{}'.format(info.dwFileVersionMS >> 16, info.dwFileVersionMS & 0xffff,
                                     info.dwFileVersionLS >> 16, info.dwFileVersionLS & 0xffff)
 
-    def is_x64(self, handle):
+    def architecture(self, handle):
         process_machine, native_machine = WORD(), WORD()
         if not self._machine(handle, ctypes.byref(process_machine), ctypes.byref(native_machine)):
             raise _winapi_error('IsWow64Process2')
-        return process_machine.value == AMD64 or (process_machine.value == 0 and native_machine.value == AMD64)
+        # UNKNOWN (0) means a native process; use the host machine in that case.
+        machine = process_machine.value or native_machine.value
+        return MACHINE_NAMES.get(machine, f'unknown:0x{machine:04x}')
+
+    def is_x64(self, handle):
+        return self.architecture(handle) == 'x64'
 
     def query(self, handle, address):
         info = _MEMORY_BASIC_INFORMATION()
@@ -360,9 +369,10 @@ def _literal_candidates(decoded, salt):
         yield value[:32]
 
 
-def _scan(reader, salt, verify_key, chunk_size):
+def _scan(reader, salt, verify_key, chunk_size, stats=None):
     markers = set()
     seen_references, seen_blobs, seen_candidates = set(), set(), set()
+    stop = '扫描结束'
     try:
         # Reserve half the byte budget for the reference pass and graph reads.
         for base, data in reader.chunks(chunk_size, len(CONFIG_NAME) - 1, reader.byte_limit // 2):
@@ -376,6 +386,7 @@ def _scan(reader, salt, verify_key, chunk_size):
             if len(markers) >= MAX_MARKERS:
                 break
         if not markers:
+            stop = '在读取范围内未找到 Cipher 标记'
             return None
         # Search length words in C-implemented bytes.find instead of inspecting
         # every byte in Python. An exact name pointer establishes a reference.
@@ -413,7 +424,13 @@ def _scan(reader, salt, verify_key, chunk_size):
                                             return candidate
                 offset = data.find(length_word, offset + 1)
     except _LimitReached:
+        stop = '达到时间、读取量或对象数量上限'
         return None
+    finally:
+        if stats is not None:
+            stats.update(markers=len(markers), references=len(seen_references),
+                         blobs=len(seen_blobs), candidates=len(seen_candidates),
+                         bytes_requested=reader.bytes_requested, stop=stop)
     return None
 
 
@@ -451,6 +468,7 @@ def find_db_key(database_path, verify_key: Callable[[bytes], bool], *,
         raise WindowsWechatError('数据库不足 16 字节，无法取得 salt。')
     scanned = 0
     excluded = []
+    summaries = []
     for process in supported:
         pid = process['pid']
         with ExitStack() as handles:
@@ -469,8 +487,9 @@ def find_db_key(database_path, verify_key: Callable[[bytes], bool], *,
                     excluded.append(f'PID {pid}: 复查版本失败或版本暂不支持')
                     continue
                 stage = 'IsWow64Process2'
-                if not api.is_x64(handle):
-                    excluded.append(f'PID {pid}: 进程架构不是当前支持的 x64')
+                architecture = api.architecture(handle)
+                if architecture not in ('x64', 'arm64'):
+                    excluded.append(f'PID {pid}: 不支持的进程架构 {architecture}，仅探测 x64 / arm64')
                     continue
             except OSError as exc:
                 excluded.append(_failure_detail(pid, stage, exc))
@@ -479,16 +498,24 @@ def find_db_key(database_path, verify_key: Callable[[bytes], bool], *,
             reader = _Reader(api, handle, max_bytes_per_process, time.monotonic() + timeout)
             # Verifier errors, including OSError, belong to the caller and must
             # propagate rather than being mistaken for a process access failure.
-            key = _scan(reader, salt, verify_key, chunk_size)
+            stats = {}
+            key = _scan(reader, salt, verify_key, chunk_size, stats)
             if key is not None:
                 return key
+            summaries.append(
+                f'PID {pid} ({architecture}): 读取请求 {stats["bytes_requested"] // 1024} KiB，'
+                f'标记 {stats["markers"]}，引用 {stats["references"]}，'
+                f'对象 {stats["blobs"]}，候选 {stats["candidates"]}；{stats["stop"]}'
+            )
     details = '\n'.join(excluded)
     if not scanned:
         raise WindowsWechatError(
             '尚未进入密钥扫描：所有候选微信进程均在读取准备阶段被排除。\n' + details
         )
     raise WindowsWechatError(
-        f'未在 {scanned} 个已确认的 x64 微信进程的有限扫描中找到通过数据库验证的密钥。'
-        '可能未打开目标数据库、读取受限、达到扫描上限，或当前 WCDB 布局暂不支持；不保证所有 4.1+ 版本兼容。'
+        f'未在 {scanned} 个 64 位微信进程的有限扫描中找到通过数据库验证的密钥。'
+        '可能未打开目标数据库、读取受限、达到扫描上限，或当前布局不匹配。'
+        'ARM64 的对象布局与掩码仍待实机验证。\n'
+        + '\n'.join(summaries)
         + ('\n其他进程的排除原因：\n' + details if details else '')
     )
