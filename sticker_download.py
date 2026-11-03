@@ -31,6 +31,16 @@ _EXTENSIONS = {'GIF': '.gif', 'PNG': '.png', 'JPEG': '.jpg',
                'WEBP': '.webp', 'BMP': '.bmp'}
 
 
+class PartialDownloadError(RuntimeError):
+    """Finished a download pass with recoverable failures and usable images."""
+    def __init__(self, successful_paths, failures):
+        self.successful_paths = list(successful_paths)
+        self.failures = list(failures)
+        detail = '; '.join(f'{key[:12]}: {reason}' for key, reason in self.failures)
+        super().__init__(f'{len(self.failures)} sticker record(s) failed; '
+                         f'successful downloads were preserved: {detail}')
+
+
 class _DownloadError(Exception):
     def __init__(self, message, retryable=False):
         super().__init__(message)
@@ -339,7 +349,8 @@ def download_stickers(records, output_dir, manifest_path, account='', *,
     and accounts. Returned files contain the original bytes, including animation.
     The local manifest may contain source URLs; exception text never includes
     URLs or raw network/decoder error messages. A batch with any failed records
-    raises RuntimeError after processing the rest. Successful checkpoints survive.
+    raises PartialDownloadError after processing the rest; its successful_paths
+    preserve input order so the caller can group usable images. Checkpoints survive.
     Invalid arguments raise ValueError before any downloads or manifest changes.
     An unreadable manifest is never replaced. Checkpoint-write failures stop the
     batch and remove its newly written, uncheckpointed image.
@@ -471,7 +482,7 @@ def download_stickers(records, output_dir, manifest_path, account='', *,
             checkpoint(job, outcome)
     if failures:
         report(f'本轮结束：{len(failures)} 条失败，成功记录已保留，可重新运行重试失败项。')
-        detail = '; '.join(f'{key[:12]}: {reason}' for key, reason in failures)
-        raise RuntimeError(f'{len(failures)} sticker record(s) failed; successful downloads were preserved: {detail}')
+        successful_paths = [paths_by_key[key] for key in identities if key in paths_by_key]
+        raise PartialDownloadError(successful_paths, failures)
     report(f'下载完成：{len(records)} 条记录，{len(set(paths_by_key.values()))} 个图片文件。')
     return [paths_by_key[key] for key in identities]

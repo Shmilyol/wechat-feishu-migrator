@@ -410,8 +410,11 @@ class DownloadTests(unittest.TestCase):
                                        urllib.error.URLError(secret),
                                        Response(image_bytes(color='green'))]
         records = [self.record('good'), self.record('bad', [secret]), self.record('later')]
-        with self.assertRaisesRegex(RuntimeError, '1 sticker record') as caught:
+        with self.assertRaisesRegex(downloader.PartialDownloadError, '1 sticker record') as caught:
             self.download(records, retries=0)
+        self.assertEqual([p.read_bytes() for p in caught.exception.successful_paths],
+                         [image_bytes(), image_bytes(color='green')])
+        self.assertEqual(len(caught.exception.failures), 1)
         self.assertNotIn('private-secret', str(caught.exception))
         self.assertEqual([e['status'] for e in self.entries()], ['success', 'failed', 'success'])
         self.assertEqual(len(list(self.output.iterdir())), 2)

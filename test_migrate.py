@@ -69,6 +69,65 @@ class MigrationTests(unittest.TestCase):
         run.assert_not_called()
         self.assertEqual(migrate.load_json(self.root / 'source_order.json', []), ['收藏.gif'])
 
+    def test_partial_download_still_groups_successes_in_source_order(self):
+        from sticker_download import PartialDownloadError
+        migrate.RAW_EXPORT.mkdir(parents=True)
+        images = []
+        for index in range(51):
+            # Reverse names to distinguish collection order from filename sorting.
+            image = migrate.RAW_EXPORT / f'{50 - index:03}.gif'
+            image.write_bytes(str(index).encode())
+            images.append(image)
+        error = PartialDownloadError(images, [('missing', 'no candidate URLs')])
+        with patch.object(migrate.sys, 'platform', 'win32'), \
+                patch.object(migrate.sys, 'argv', ['migrate.py', '--all', '--yes']), \
+                patch('wechat_source.export_favorites', side_effect=error), \
+                patch.object(migrate, 'migrate') as upload, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(migrate.main(), 1)
+        self.assertEqual(migrate.load_json(self.root / 'source_order.json', []), [p.name for p in images])
+        self.assertEqual(len(list((migrate.EXPORT / '1').iterdir())), 50)
+        self.assertEqual(len(list((migrate.EXPORT / '2').iterdir())), 1)
+        self.assertTrue((migrate.EXPORT / '2' / '000.gif').exists())
+        self.assertIn('1', stderr.getvalue())
+        upload.assert_not_called()
+
+    def test_real_download_failure_preserves_successes_for_grouping(self):
+        import sqlite3
+        from PIL import Image
+        database = self.root / 'data/wxid_fixture/db_storage/emoticon/emoticon.db'
+        database.parent.mkdir(parents=True)
+        with contextlib.closing(sqlite3.connect(database)) as db, db:
+            db.execute('PRAGMA page_size=4096')
+            db.execute('CREATE TABLE kNonStoreEmoticonTable (md5 TEXT, cdn_url TEXT)')
+            db.execute('CREATE TABLE kFavEmoticonOrderTable (md5 TEXT)')
+            db.executemany('INSERT INTO kNonStoreEmoticonTable VALUES (?, ?)',
+                           [('missing', ''), ('good', 'https://example.test/good')])
+            db.executemany('INSERT INTO kFavEmoticonOrderTable VALUES (?)', [('missing',), ('good',)])
+        payload = io.BytesIO()
+        Image.new('RGB', (2, 2), 'red').save(payload, format='PNG')
+        with patch.object(migrate.sys, 'platform', 'darwin'), \
+                patch.object(migrate.sys, 'argv', ['migrate.py', '--export', '--wechat-data-dir',
+                                                  str(self.root / 'data')]), \
+                patch('sticker_download._fetch', return_value=payload.getvalue()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(migrate.main(), 1)
+        images = migrate.all_images()
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0].read_bytes(), payload.getvalue())
+        self.assertEqual(migrate.load_json(self.root / 'source_order.json', []), [images[0].name])
+
+    def test_other_export_errors_do_not_group_or_start_upload(self):
+        with patch.object(migrate.sys, 'platform', 'win32'), \
+                patch.object(migrate.sys, 'argv', ['migrate.py', '--all']), \
+                patch('wechat_source.export_favorites', side_effect=RuntimeError('wrong key')), \
+                patch.object(migrate, 'group_exports') as group, \
+                patch.object(migrate, 'migrate') as upload, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(migrate.main(), 1)
+        group.assert_not_called()
+        upload.assert_not_called()
+
     def test_file_picker_sequences(self):
         cfg = {'add_button': [100, 200], 'picker_delay': 1, 'upload_delay': 1}
         self.root.mkdir()

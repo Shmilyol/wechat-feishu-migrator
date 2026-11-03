@@ -46,9 +46,14 @@ def require_desktop_platform():
 def run_export(wechat_data_dir=None, wxid=None, key_file=None):
     require_desktop_platform()
     from wechat_source import export_favorites
+    from sticker_download import PartialDownloadError
     RAW_EXPORT.mkdir(parents=True, exist_ok=True)
-    images = export_favorites(RAW_EXPORT, ROOT / 'download_manifest.json',
-                              data_dir=wechat_data_dir, wxid=wxid, key_file=key_file)
+    try:
+        images = export_favorites(RAW_EXPORT, ROOT / 'download_manifest.json',
+                                 data_dir=wechat_data_dir, wxid=wxid, key_file=key_file)
+    except PartialDownloadError as exc:
+        save_json(ROOT / 'source_order.json', [p.name for p in exc.successful_paths])
+        raise
     save_json(ROOT / 'source_order.json', [p.name for p in images])
     return images
 
@@ -501,8 +506,17 @@ def main():
         if not args.group_only:
             require_desktop_platform()
         if args.export or args.all:
+            from sticker_download import PartialDownloadError
             move_old_flat_exports()
-            run_export(args.wechat_data_dir, args.wxid, args.key_file)
+            try:
+                run_export(args.wechat_data_dir, args.wxid, args.key_file)
+            except PartialDownloadError as exc:
+                group_exports()
+                print(f'导出未完整：本轮 {len(exc.successful_paths)} 条收藏已下载，'
+                      f'{len(exc.failures)} 条失败；成功图片已分组，可单独运行 --import 添加。',
+                      file=sys.stderr)
+                print(f'失败详情：{exc}', file=sys.stderr)
+                return 1
             group_exports()
         elif args.group_only or args.do_import:
             group_exports()
