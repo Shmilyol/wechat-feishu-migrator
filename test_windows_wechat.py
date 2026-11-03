@@ -243,6 +243,41 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(self.find(), self.key)
         self.assertNotIn((10, True), self.api.opens)
 
+    def test_zero_scanned_reports_memory_open_error_and_pid(self):
+        original_process = self.api.process
+        error = OSError(5, 'Access is denied')
+        error.winerror = 5
+
+        @contextlib.contextmanager
+        def process(pid, memory=False):
+            if memory:
+                raise error
+            with original_process(pid, memory=False) as handle:
+                yield handle
+
+        self.api.process = process
+        with self.assertRaises(ww.WindowsWechatError) as caught:
+            self.find()
+        message = str(caught.exception)
+        self.assertIn('尚未进入密钥扫描', message)
+        self.assertIn('PID 11', message)
+        self.assertIn('OpenProcess', message)
+        self.assertIn('WinError=5', message)
+        self.assertNotIn('WCDB', message)
+        self.assertEqual(self.api.reads, [])
+
+    def test_zero_scanned_reports_architecture_query_error_separately(self):
+        error = OSError(6, 'Invalid handle')
+        error.winerror = 6
+        self.api.is_x64 = Mock(side_effect=error)
+        with self.assertRaises(ww.WindowsWechatError) as caught:
+            self.find()
+        message = str(caught.exception)
+        self.assertIn('IsWow64Process2', message)
+        self.assertIn('WinError=6', message)
+        self.assertIn('PID 11', message)
+        self.assertEqual(self.api.reads, [])
+
     def test_global_process_byte_budget_includes_graph_and_failed_reads(self):
         reader = ww._Reader(self.api, 11, 8192, float('inf'))
         self.assertIsNone(ww._scan(reader, self.salt, lambda key: False, 128))
@@ -430,7 +465,31 @@ class WinAPITests(unittest.TestCase):
                 self.assertEqual(api.is_x64(11), expected)
         kernel.IsWow64Process2.side_effect = None
         kernel.IsWow64Process2.return_value = 0
-        self.assertFalse(api.is_x64(11))
+        with patch.object(ctypes, 'get_last_error', create=True, return_value=6):
+            with self.assertRaises(OSError) as caught:
+                api.is_x64(11)
+        self.assertIn('IsWow64Process2', str(caught.exception))
+        self.assertIn('WinError=6', str(caught.exception))
+
+    def test_failed_open_keeps_windows_error_code(self):
+        api, kernel, _ = self.make_api()
+        kernel.OpenProcess.return_value = 0
+        with patch.object(ctypes, 'get_last_error', create=True, return_value=5):
+            with self.assertRaises(OSError) as caught:
+                with api.process(11, memory=True):
+                    self.fail('failed OpenProcess must not yield a handle')
+        self.assertIn('OpenProcess', str(caught.exception))
+        self.assertIn('WinError=5', str(caught.exception))
+        kernel.CloseHandle.assert_not_called()
+
+    def test_failed_image_query_keeps_windows_error_code(self):
+        api, kernel, _ = self.make_api()
+        kernel.QueryFullProcessImageNameW.return_value = 0
+        with patch.object(ctypes, 'get_last_error', create=True, return_value=6):
+            with self.assertRaises(OSError) as caught:
+                api.image(11)
+        self.assertIn('QueryFullProcessImageNameW', str(caught.exception))
+        self.assertIn('WinError=6', str(caught.exception))
 
 
 if __name__ == '__main__':

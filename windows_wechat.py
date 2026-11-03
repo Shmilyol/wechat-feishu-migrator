@@ -88,6 +88,24 @@ class _VS_FIXEDFILEINFO(ctypes.Structure):
     )]
 
 
+def _winapi_error(operation):
+    # Capture immediately: subsequent WinAPI calls may overwrite last-error.
+    code = getattr(ctypes, 'get_last_error', lambda: 0)()
+    return OSError(code, f'{operation} 失败（WinError={code}）', None, code)
+
+
+def _failure_detail(pid, stage, error):
+    code = getattr(error, 'winerror', None)
+    if code is None:
+        code = error.errno
+    detail = f'WinError={code}' if code is not None else '系统未提供错误码'
+    if code == 5:
+        detail += '，访问被拒绝；请确认终端与微信以相同权限运行'
+    elif code == 87:
+        detail += '，参数无效或进程已退出'
+    return f'PID {pid}: {stage} 失败（{detail}）'
+
+
 def _handle_value(handle):
     return handle.value if isinstance(handle, ctypes.c_void_p) else handle
 
@@ -153,7 +171,7 @@ class _WindowsAPI:
         rights = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ if memory else PROCESS_QUERY_LIMITED_INFORMATION
         handle = self._open(rights, False, pid)
         if not _valid_handle(handle):
-            raise OSError('无法以只读权限打开微信进程。')
+            raise _winapi_error('OpenProcess')
         try:
             yield handle
         finally:
@@ -182,7 +200,7 @@ class _WindowsAPI:
         buffer = ctypes.create_unicode_buffer(32768)
         size = DWORD(len(buffer))
         if not self._image(handle, 0, buffer, ctypes.byref(size)):
-            raise OSError('无法查询微信可执行文件路径。')
+            raise _winapi_error('QueryFullProcessImageNameW')
         return buffer.value
 
     def file_version(self, exe):
@@ -207,7 +225,7 @@ class _WindowsAPI:
     def is_x64(self, handle):
         process_machine, native_machine = WORD(), WORD()
         if not self._machine(handle, ctypes.byref(process_machine), ctypes.byref(native_machine)):
-            return False
+            raise _winapi_error('IsWow64Process2')
         return process_machine.value == AMD64 or (process_machine.value == 0 and native_machine.value == AMD64)
 
     def query(self, handle, address):
@@ -432,18 +450,30 @@ def find_db_key(database_path, verify_key: Callable[[bytes], bool], *,
     if len(salt) != 16:
         raise WindowsWechatError('数据库不足 16 字节，无法取得 salt。')
     scanned = 0
+    excluded = []
     for process in supported:
+        pid = process['pid']
         with ExitStack() as handles:
+            stage = 'OpenProcess'
             try:
-                handle = handles.enter_context(api.process(process['pid'], memory=True))
+                handle = handles.enter_context(api.process(pid, memory=True))
                 # Recheck identity after opening: the original process may have
                 # exited and its PID may now belong to a different application.
+                stage = 'QueryFullProcessImageNameW'
                 exe = api.image(handle)
                 if not _wechat_image(exe) or ntpath.normcase(exe) != ntpath.normcase(process['exe']):
+                    excluded.append(f'PID {pid}: 进程身份已变化，未读取内存')
                     continue
-                if not _supported_version(api.file_version(exe)) or not api.is_x64(handle):
+                stage = 'FILEVERSION'
+                if not _supported_version(api.file_version(exe)):
+                    excluded.append(f'PID {pid}: 复查版本失败或版本暂不支持')
                     continue
-            except OSError:
+                stage = 'IsWow64Process2'
+                if not api.is_x64(handle):
+                    excluded.append(f'PID {pid}: 进程架构不是当前支持的 x64')
+                    continue
+            except OSError as exc:
+                excluded.append(_failure_detail(pid, stage, exc))
                 continue
             scanned += 1
             reader = _Reader(api, handle, max_bytes_per_process, time.monotonic() + timeout)
@@ -452,7 +482,13 @@ def find_db_key(database_path, verify_key: Callable[[bytes], bool], *,
             key = _scan(reader, salt, verify_key, chunk_size)
             if key is not None:
                 return key
+    details = '\n'.join(excluded)
+    if not scanned:
+        raise WindowsWechatError(
+            '尚未进入密钥扫描：所有候选微信进程均在读取准备阶段被排除。\n' + details
+        )
     raise WindowsWechatError(
         f'未在 {scanned} 个已确认的 x64 微信进程的有限扫描中找到通过数据库验证的密钥。'
         '可能未打开目标数据库、读取受限、达到扫描上限，或当前 WCDB 布局暂不支持；不保证所有 4.1+ 版本兼容。'
+        + ('\n其他进程的排除原因：\n' + details if details else '')
     )
