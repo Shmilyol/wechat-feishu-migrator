@@ -39,6 +39,8 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_VM_READ = 0x0010
 TH32CS_SNAPPROCESS = 0x00000002
 MEM_COMMIT = 0x1000
+MEM_IMAGE = 0x1000000
+MEM_PRIVATE = 0x20000
 PAGE_GUARD = 0x100
 READABLE_PROTECTIONS = {0x02, 0x04, 0x08, 0x20, 0x40, 0x80}
 AMD64 = 0x8664
@@ -242,13 +244,14 @@ class _WindowsAPI:
         result = self._query(handle, address, ctypes.byref(info), ctypes.sizeof(info))
         if result != ctypes.sizeof(info):
             return None
-        return (info.BaseAddress or 0, info.RegionSize, info.State, info.Protect)
+        return (info.BaseAddress or 0, info.RegionSize, info.State, info.Protect, info.Type)
 
     def read(self, handle, address, size):
         buffer = ctypes.create_string_buffer(size)
         count = SIZE_T()
         ok = self._read(handle, address, buffer, size, ctypes.byref(count))
         # Failed/partial reads must not be joined into invented contiguous memory.
+        self.last_read_error = 0 if ok else getattr(ctypes, 'get_last_error', lambda: 0)()
         return buffer.raw if ok and count.value == size else None
 
 
@@ -295,7 +298,12 @@ class _Reader:
         self.api, self.handle = api, handle
         self.byte_limit, self.deadline = byte_limit, deadline
         self.bytes_requested = 0
+        self.bytes_read = 0
+        self.read_failures = 0
+        self.last_read_error = 0
         self.queries = 0
+        self.regions = None
+        self.phase_limited = False
 
     def check(self):
         if time.monotonic() >= self.deadline:
@@ -327,37 +335,68 @@ class _Reader:
         # Count requested bytes, including failures and graph reads, not just successes.
         self.bytes_requested += size
         data = self.api.read(self.handle, address, size)
-        return data if data is not None and len(data) == size else None
+        if data is not None and len(data) == size:
+            self.bytes_read += size
+            return data
+        self.read_failures += 1
+        self.last_read_error = getattr(self.api, 'last_read_error', 0)
+        return None
 
-    def chunks(self, chunk_size, carry, phase_limit):
-        address, requested = MIN_ADDRESS, 0
-        while address <= MAX_ADDRESS and requested < phase_limit:
-            region = self.query(address)
-            if region is None:
-                return
+    def memory_regions(self):
+        if self.regions is None:
+            regions = []
+            address = MIN_ADDRESS
+            while address <= MAX_ADDRESS:
+                region = self.query(address)
+                if region is None:
+                    break
+                base, size = region[:2]
+                end = base + size
+                if size <= 0 or base > address or end <= address or end > MAX_ADDRESS + 1:
+                    break
+                if _readable(region):
+                    regions.append(region)
+                address = end
+            self.regions = regions
+        return self.regions
+
+    def chunks(self, chunk_size, carry, phase_limit, priority=None):
+        regions = self.memory_regions()
+
+        def rank(region):
+            kind = region[4] if len(region) > 4 else 0
+            protection = region[3] & 0xff
+            if priority == 'markers':
+                # Constant strings usually live in an image's read-only data.
+                return (0 if kind == MEM_IMAGE and protection == 0x02
+                        else 1 if kind == MEM_IMAGE else 2)
+            if priority == 'references':
+                # WCDB config objects are usually heap allocations.
+                return 0 if kind == MEM_PRIVATE and protection in (0x04, 0x08) else 1
+            return 0
+
+        requested = 0
+        self.phase_limited = False
+        for region in sorted(regions, key=rank):
             base, size = region[:2]
-            end = base + size
-            if size <= 0 or base > address or end <= address or end > MAX_ADDRESS + 1:
-                return
-            if _readable(region):
-                cursor = max(base, address)
-                tail = b''
-                while cursor < end and requested < phase_limit:
-                    self.check()
-                    wanted = min(chunk_size, end - cursor, phase_limit - requested,
-                                 self.byte_limit - self.bytes_requested)
-                    if wanted <= 0:
-                        return
-                    data = self.read(cursor, wanted, known_readable=True)
-                    requested += wanted
-                    if data is None:
-                        tail = b''
-                    else:
-                        combined = tail + data
-                        yield cursor - len(tail), combined
-                        tail = combined[-carry:] if carry else b''
-                    cursor += wanted
-            address = end
+            cursor, end = base, base + size
+            tail = b''
+            while cursor < end:
+                self.check()
+                wanted = min(chunk_size, end - cursor, phase_limit - requested,
+                             self.byte_limit - self.bytes_requested)
+                if wanted <= 0:
+                    self.phase_limited = True
+                    return
+                data = self.read(cursor, wanted, known_readable=True)
+                requested += wanted
+                if data is None:
+                    tail = b''
+                else:
+                    combined = tail + data
+                    yield cursor - len(tail), combined
+                    tail = combined[-carry:] if carry else b''
+                cursor += wanted
 
 
 def _literal_candidates(decoded, salt):
@@ -375,7 +414,8 @@ def _scan(reader, salt, verify_key, chunk_size, stats=None):
     stop = '扫描结束'
     try:
         # Reserve half the byte budget for the reference pass and graph reads.
-        for base, data in reader.chunks(chunk_size, len(CONFIG_NAME) - 1, reader.byte_limit // 2):
+        for base, data in reader.chunks(chunk_size, len(CONFIG_NAME) - 1,
+                                        reader.byte_limit // 2, priority='markers'):
             position = data.find(CONFIG_NAME)
             while position >= 0:
                 reader.check()
@@ -386,12 +426,14 @@ def _scan(reader, salt, verify_key, chunk_size, stats=None):
             if len(markers) >= MAX_MARKERS:
                 break
         if not markers:
-            stop = '在读取范围内未找到 Cipher 标记'
+            stop = ('标记阶段读取预算已耗尽，未找到 Cipher 标记' if reader.phase_limited
+                    else '已枚举可读区域中未找到 Cipher 标记')
             return None
         # Search length words in C-implemented bytes.find instead of inspecting
         # every byte in Python. An exact name pointer establishes a reference.
         length_word = struct.pack('<Q', len(CONFIG_NAME))
-        for base, data in reader.chunks(chunk_size, 15, reader.byte_limit - reader.bytes_requested):
+        for base, data in reader.chunks(chunk_size, 15, reader.byte_limit - reader.bytes_requested,
+                                        priority='references'):
             offset = data.find(length_word, 8)
             while offset >= 8:
                 reader.check()
@@ -423,6 +465,8 @@ def _scan(reader, salt, verify_key, chunk_size, stats=None):
                                         if verify_key(candidate):
                                             return candidate
                 offset = data.find(length_word, offset + 1)
+        if reader.phase_limited:
+            stop = '引用阶段读取预算已耗尽'
     except _LimitReached:
         stop = '达到时间、读取量或对象数量上限'
         return None
@@ -430,7 +474,9 @@ def _scan(reader, salt, verify_key, chunk_size, stats=None):
         if stats is not None:
             stats.update(markers=len(markers), references=len(seen_references),
                          blobs=len(seen_blobs), candidates=len(seen_candidates),
-                         bytes_requested=reader.bytes_requested, stop=stop)
+                         bytes_requested=reader.bytes_requested, bytes_read=reader.bytes_read,
+                         read_failures=reader.read_failures, last_read_error=reader.last_read_error,
+                         regions=len(reader.regions or ()), stop=stop)
     return None
 
 
@@ -503,8 +549,11 @@ def find_db_key(database_path, verify_key: Callable[[bytes], bool], *,
             if key is not None:
                 return key
             summaries.append(
-                f'PID {pid} ({architecture}): 读取请求 {stats["bytes_requested"] // 1024} KiB，'
-                f'标记 {stats["markers"]}，引用 {stats["references"]}，'
+                f'PID {pid} ({architecture}): 可读区域 {stats["regions"]}，'
+                f'读取请求 {stats["bytes_requested"] // 1024} KiB，'
+                f'成功 {stats["bytes_read"] // 1024} KiB，失败 {stats["read_failures"]} 次'
+                + (f'（最后 WinError={stats["last_read_error"]}）' if stats['last_read_error'] else '')
+                + f'，标记 {stats["markers"]}，引用 {stats["references"]}，'
                 f'对象 {stats["blobs"]}，候选 {stats["candidates"]}；{stats["stop"]}'
             )
     details = '\n'.join(excluded)

@@ -309,6 +309,50 @@ class ScanTests(unittest.TestCase):
         self.assertNotIn(self.salt.hex(), message)
         self.assertNotIn(hex(ww.MIN_ADDRESS), message)
 
+    def test_image_marker_is_not_starved_by_low_address_heap_budget(self):
+        # Scale the reported 256 MiB prefix cutoff down to a 4 KiB first pass.
+        self.api.memory = bytearray(12288)
+        marker_offset = 8192 + 64
+        self.api.memory[marker_offset:marker_offset + len(ww.CONFIG_NAME)] = ww.CONFIG_NAME
+        self.api.extra_regions = [
+            (ww.MIN_ADDRESS, 8192, ww.MEM_COMMIT, 0x04, 0x20000),
+            (ww.MIN_ADDRESS + 8192, 4096, ww.MEM_COMMIT, 0x02, 0x1000000),
+        ]
+        reader = ww._Reader(self.api, 11, 8192, float('inf'))
+        stats = {}
+        self.assertIsNone(ww._scan(reader, self.salt, lambda _: False, 128, stats))
+        self.assertEqual(stats['markers'], 1)
+        self.assertEqual(self.api.reads[0][1], ww.MIN_ADDRESS + 8192)
+        self.assertLessEqual(reader.bytes_requested, 8192)
+
+    def test_image_first_scan_still_resolves_private_heap_references(self):
+        memory = bytearray(20480)
+        memory[:4096] = synthetic_memory(self.key, self.salt)
+        memory[127:127 + len(ww.CONFIG_NAME)] = bytes(len(ww.CONFIG_NAME))
+        marker_offset = 16384 + 64
+        memory[marker_offset:marker_offset + len(ww.CONFIG_NAME)] = ww.CONFIG_NAME
+        struct.pack_into('<Q', memory, 503, ww.MIN_ADDRESS + marker_offset)
+        self.api.memory = memory
+        self.api.extra_regions = [
+            (ww.MIN_ADDRESS, 8192, ww.MEM_COMMIT, 0x04, 0x20000),
+            (ww.MIN_ADDRESS + 8192, 8192, 0, 0, 0),
+            (ww.MIN_ADDRESS + 16384, 4096, ww.MEM_COMMIT, 0x02, 0x1000000),
+        ]
+        reader = ww._Reader(self.api, 11, 16384, float('inf'))
+        verifier = Mock(side_effect=lambda key: key == self.key)
+        self.assertEqual(ww._scan(reader, self.salt, verifier, 128), self.key)
+        verifier.assert_called_once_with(self.key)
+        self.assertEqual(self.api.reads[0][1], ww.MIN_ADDRESS + 16384)
+        self.assertLessEqual(reader.bytes_requested, 16384)
+
+    def test_scan_distinguishes_successful_bytes_from_failed_requests(self):
+        self.api.bad_reads.add(ww.MIN_ADDRESS)
+        reader = ww._Reader(self.api, 11, 8192, float('inf'))
+        stats = {}
+        self.assertIsNone(ww._scan(reader, self.salt, lambda _: False, 128, stats))
+        self.assertEqual(stats['read_failures'], 1)
+        self.assertEqual(stats['bytes_read'], stats['bytes_requested'] - 128)
+
     def test_global_process_byte_budget_includes_graph_and_failed_reads(self):
         reader = ww._Reader(self.api, 11, 8192, float('inf'))
         self.assertIsNone(ww._scan(reader, self.salt, lambda key: False, 128))
@@ -535,6 +579,22 @@ class WinAPITests(unittest.TestCase):
         self.assertIn('OpenProcess', str(caught.exception))
         self.assertIn('WinError=5', str(caught.exception))
         kernel.CloseHandle.assert_not_called()
+
+    def test_virtual_query_preserves_region_type_for_scan_priority(self):
+        api, kernel, _ = self.make_api()
+
+        def query(handle, address, pointer, size):
+            info = pointer._obj
+            info.BaseAddress = ww.MIN_ADDRESS
+            info.RegionSize = 4096
+            info.State = ww.MEM_COMMIT
+            info.Protect = 0x02
+            info.Type = 0x1000000
+            return ctypes.sizeof(info)
+
+        kernel.VirtualQueryEx.side_effect = query
+        self.assertEqual(api.query(11, ww.MIN_ADDRESS),
+                         (ww.MIN_ADDRESS, 4096, ww.MEM_COMMIT, 0x02, 0x1000000))
 
     def test_failed_image_query_keeps_windows_error_code(self):
         api, kernel, _ = self.make_api()
