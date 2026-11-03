@@ -4,6 +4,7 @@
 Reads local WeChat favorites and uses optional desktop UI automation. No Feishu API.
 """
 import argparse
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 HOME = Path.home()
@@ -366,6 +368,25 @@ def open_folder(path):
         subprocess.run(['open', str(path)], check=True)
 
 
+@contextmanager
+def manual_batch(paths):
+    """Expose exactly this batch with short names; preserve source files and state."""
+    directory = ROOT / 'import-batches'
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='batch-', dir=directory,
+                                     ignore_cleanup_errors=True) as temporary:
+        folder = Path(temporary)
+        selected = []
+        for number, source in enumerate(paths, 1):
+            target = folder / f'{number:03d}{source.suffix.lower()}'
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copy2(source, target)
+            selected.append(target)
+        yield folder, selected
+
+
 def confirmed_indices(answer, count):
     answer = answer.strip().casefold()
     if answer in ('y', 'yes', '全部'):
@@ -397,20 +418,32 @@ def migrate(args):
     state.setdefault('attempted', {})
     state.setdefault('verified', {})
     pending, seen = [], set()
+    duplicate_count = verified_count = uncertain_count = 0
     for path in images:
         digest = fingerprint(path)
-        if digest not in seen and digest not in state['verified']:
+        if digest in seen:
+            duplicate_count += 1
+            continue
+        seen.add(digest)
+        if digest in state['verified']:
+            verified_count += 1
+        elif digest in state['attempted'] and not args.retry_attempted:
+            uncertain_count += 1
+        else:
             pending.append((path, digest))
-            seen.add(digest)
-    if not args.retry_attempted:
-        pending = [(p, h) for p, h in pending if h not in state['attempted']]
+    print(f'本地图片：{len(images)} 个文件。')
+    print(f'本次跳过：重复内容 {duplicate_count} 张，已人工确认 {verified_count} 张，'
+          f'曾尝试但未确认 {uncertain_count} 张。')
+    print(f'可继续处理：{len(pending)} 张。')
+    if uncertain_count:
+        print('曾尝试但未确认的图片没有丢失；核查飞书后，可用 --retry-attempted 再次处理。')
     if args.limit is not None:
         pending = pending[:args.limit]
-    print(f'总文件 {len(images)}，本次准备尝试 {len(pending)}。')
     if not pending:
+        print('当前没有待处理图片。')
         return
     if not args.yes:
-        print('安全模式：默认只尝试第一张。用 --yes 才会执行设置的数量。')
+        print('首次试用：这次只处理 1 张，成功后再批量继续。')
         pending = pending[:1]
     batch_size = getattr(args, 'batch_size', GROUP_SIZE)
     if args.pause_every:
@@ -419,42 +452,80 @@ def migrate(args):
         batch_size = 1
     batches = import_batches(pending, batch_size)
     pg = None if manual else ui_lib()
-    print('请保持飞书在个人表情添加界面。每批完成后，回终端确认实际成功的图片。')
-    input('按回车开始；Ctrl+C 可停止：')
+    print(f'本次实际处理 {len(pending)} 张，共 {len(batches)} 批，每批最多 {batch_size} 张。')
+    if manual:
+        print('\n【手动添加】你负责在飞书选择图片并提交；脚本负责准备图片和记录结果。')
+        print('先打开飞书任意聊天 → 点击输入框旁的表情按钮 → 找到个人/收藏表情的「+ 添加」。')
+        print('目标是加入个人表情收藏，不是把图片作为普通消息发到聊天中。')
+        input('准备好飞书后，回到这里按回车：脚本将打开只含本批图片的文件夹（Ctrl+C 退出）：')
+    else:
+        print('请保持飞书在个人表情添加界面。每批完成后，回终端确认实际成功的图片。')
+        input('按回车开始；Ctrl+C 可停止：')
     attempted_count = 0
+    stopped_unconfirmed = False
     for index, batch in enumerate(batches, 1):
         paths = [p for p, _ in batch]
-        print(f'\n批次 {index}/{len(batches)}，分组 {paths[0].parent.name}，共 {len(paths)} 张：')
-        for number, path in enumerate(paths, 1):
-            print(f'  {number}. {path.name}')
-        if not manual:
-            activate_feishu(cfg.get('app_name', '飞书'))
-            time.sleep(.5)
-        # Persist uncertainty before interacting: interruption may happen after submission.
-        for path, digest in batch:
-            state['attempted'][digest] = {'file': str(path), 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'status': 'attempted_unverified'}
-        save_json(STATE, state)
-        if manual:
-            open_folder(paths[0].parent)
-            input('请在飞书只选择上述图片并添加，完成后回到终端按回车：')
-        else:
-            choose_files(pg, paths, cfg)
-        attempted_count += len(batch)
-        while True:
-            answer = input('核查飞书后确认：全部成功输入 y；部分成功输入序号如 1,3；未确认输入 n：')
-            try:
-                confirmed = confirmed_indices(answer, len(batch))
-                break
-            except ValueError as exc:
-                print(exc)
-        for item in confirmed:
-            path, digest = batch[item]
-            state['verified'][digest] = {'file': str(path), 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'status': 'user_confirmed'}
-        save_json(STATE, state)
+        selection = manual_batch(paths) if manual else nullcontext((paths[0].parent, paths))
+        with selection as (folder, selected):
+            print(f'\n批次 {index}/{len(batches)}：本批共 {len(paths)} 张图片。')
+            for number, path in enumerate(selected, 1):
+                print(f'  {number}. {path.name}')
+            if not manual:
+                activate_feishu(cfg.get('app_name', '飞书'))
+                time.sleep(.5)
+            # Persist uncertainty before interacting: interruption may happen after submission.
+            for path, digest in batch:
+                state['attempted'][digest] = {'file': str(path), 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'status': 'attempted_unverified'}
+            save_json(STATE, state)
+            if manual:
+                print('\n本批选择目录（复制下面整行路径）：')
+                print(folder)
+                print('这个临时目录只含本批图片；窗口弹出只是方便查看，图片尚未上传到飞书。')
+                print('接下来请按顺序操作：')
+                print('  1. 切回飞书，点击个人/收藏表情中的「+ 添加」，打开选择图片窗口。')
+                if sys.platform == 'win32':
+                    print('  2. 在飞书的选择图片窗口按 Ctrl+L，粘贴上面的目录路径，按回车。')
+                    print('  3. 在该窗口按 Ctrl+A 选中本批全部图片，再点击「打开」。')
+                else:
+                    print('  2. 在飞书的选择图片窗口按 Cmd+Shift+G，粘贴目录路径，按回车进入。')
+                    print('  3. 按 Cmd+A 选中本批全部图片，再点击「打开」。')
+                print('  4. 如果飞书还有预览或确认窗口，点击「添加/确认」，等待完成。')
+                print('  5. 在飞书个人表情列表核查结果，再切回终端输入下面的确认选项。')
+                open_folder(folder)
+            else:
+                choose_files(pg, paths, cfg)
+            attempted_count += len(batch)
+            while True:
+                answer = input('飞书已全部添加成功：输入 y 后回车；部分成功：输入序号如 1,3；未完成/不确定：输入 n 后回车：')
+                try:
+                    confirmed = confirmed_indices(answer, len(batch))
+                    break
+                except ValueError as exc:
+                    print(exc)
+            for item in confirmed:
+                path, digest = batch[item]
+                state['verified'][digest] = {'file': str(path), 'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'status': 'user_confirmed'}
+            save_json(STATE, state)
         if len(confirmed) != len(batch):
-            print('本批尚有未确认图片，已暂停后续批次。核查后用 --retry-attempted 重试未确认项。')
+            stopped_unconfirmed = True
+            print('本批尚有未确认图片，已暂停后续批次。核查飞书后再重试，避免重复添加。')
             break
-    print(f'\n本次尝试 {attempted_count} 张；累计人工确认 {len(state["verified"])} 张。状态：{STATE}')
+    confirmed_count = sum(digest in state['verified'] for digest in seen)
+    remaining = seen - state['verified'].keys()
+    print(f'\n本次已操作 {attempted_count} 张；当前图片中累计人工确认 {confirmed_count} 张。')
+    print(f'进度已保存：{STATE}')
+    if remaining:
+        entry = (r'.\.venv\Scripts\python.exe .\migrate.py' if sys.platform == 'win32'
+                 else './.venv/bin/python3 migrate.py')
+        command = entry + ' --import' + (' --manual-import' if manual else '') + ' --yes'
+        if stopped_unconfirmed or all(digest in state['attempted'] for digest in remaining):
+            command += ' --retry-attempted'
+            print('核查飞书后，重试未确认图片可执行：')
+        else:
+            print('确认试用效果后，批量继续执行（每批最多 50 张）：')
+        print(command)
+    else:
+        print('当前本地图片已全部人工确认。')
 
 
 def main():

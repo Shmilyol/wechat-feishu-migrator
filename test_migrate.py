@@ -229,6 +229,97 @@ class MigrationTests(unittest.TestCase):
         migrate.save_json(migrate.CONFIG, {'platform': platform, 'app_name': '飞书'})
         return types.SimpleNamespace(retry_attempted=False, limit=None, yes=True, pause_every=1)
 
+    def test_manual_trial_prepares_exact_selection_without_automating_feishu(self):
+        args = self.prepare_import('win32')
+        args.manual_import = True
+        args.yes = False
+        opened = []
+        prompts = []
+
+        def open_selection(folder):
+            opened.append(folder)
+            self.assertNotEqual(folder, migrate.EXPORT / '1')
+            self.assertEqual([p.name for p in folder.iterdir()], ['001.png'])
+            self.assertEqual((folder / '001.png').read_bytes(), b'\x00')
+
+        def confirm(prompt):
+            prompts.append(prompt)
+            return '' if len(prompts) == 1 else 'y'
+
+        output = io.StringIO()
+        with patch.object(migrate.sys, 'platform', 'win32'), \
+                patch.object(migrate, 'open_folder', side_effect=open_selection), \
+                patch.object(migrate, 'ui_lib') as ui, \
+                patch.object(migrate, 'activate_feishu') as activate, \
+                patch('builtins.input', side_effect=confirm), contextlib.redirect_stdout(output):
+            migrate.migrate(args)
+        self.assertEqual(len(prompts), 2)
+        self.assertIn('只含本批图片', prompts[0])
+        self.assertIn('本次实际处理 1 张', output.getvalue())
+        self.assertIn('Ctrl+L', output.getvalue())
+        self.assertIn('Ctrl+A', output.getvalue())
+        self.assertIn('--import --manual-import --yes', output.getvalue())
+        self.assertFalse(opened[0].exists())
+        ui.assert_not_called()
+        activate.assert_not_called()
+        state = migrate.load_json(migrate.STATE, {})
+        self.assertEqual(len(state['verified']), 1)
+        self.assertTrue(next(iter(state['verified'].values()))['file'].endswith('0.png'))
+        self.assertEqual(len(list((migrate.EXPORT / '1').iterdir())), 2)
+
+    def test_manual_partial_confirmation_records_original_files(self):
+        args = self.prepare_import('win32')
+        args.manual_import = True
+        args.pause_every = 0
+        opened = []
+
+        def inspect(folder):
+            opened.append(folder)
+            self.assertEqual(sorted(p.name for p in folder.iterdir()), ['001.png', '002.png'])
+
+        with patch.object(migrate.sys, 'platform', 'win32'), \
+                patch.object(migrate, 'open_folder', side_effect=inspect), \
+                patch('builtins.input', side_effect=['', '2']):
+            migrate.migrate(args)
+        state = migrate.load_json(migrate.STATE, {})
+        self.assertEqual(len(state['attempted']), 2)
+        self.assertEqual(len(state['verified']), 1)
+        self.assertTrue(next(iter(state['verified'].values()))['file'].endswith('1.png'))
+        self.assertFalse(opened[0].exists())
+
+    def test_manual_batch_copy_fallback_preserves_originals(self):
+        folder = migrate.EXPORT / '1'
+        folder.mkdir(parents=True)
+        source = folder / 'long-name.gif'
+        source.write_bytes(b'original bytes')
+        with patch.object(migrate.os, 'link', side_effect=OSError('hard links unavailable')):
+            with migrate.manual_batch([source]) as (selection, paths):
+                self.assertEqual(paths[0].name, '001.gif')
+                self.assertEqual(paths[0].read_bytes(), b'original bytes')
+                self.assertEqual(list(selection.iterdir()), paths)
+        self.assertFalse(selection.exists())
+        self.assertEqual(source.read_bytes(), b'original bytes')
+
+    def test_skip_summary_distinguishes_duplicates_confirmed_and_uncertain(self):
+        args = self.prepare_import('win32')
+        args.manual_import = True
+        (migrate.EXPORT / '1/duplicate.png').write_bytes(b'\x01')
+        migrate.save_json(migrate.STATE, {
+            'verified': {migrate.fingerprint(migrate.EXPORT / '1/0.png'): {}},
+            'attempted': {migrate.fingerprint(migrate.EXPORT / '1/1.png'): {}},
+        })
+        output = io.StringIO()
+        with patch.object(migrate.sys, 'platform', 'win32'), \
+                patch.object(migrate, 'open_folder') as open_folder, \
+                patch('builtins.input') as prompt, contextlib.redirect_stdout(output):
+            migrate.migrate(args)
+        self.assertIn('重复内容 1 张', output.getvalue())
+        self.assertIn('已人工确认 1 张', output.getvalue())
+        self.assertIn('曾尝试但未确认 1 张', output.getvalue())
+        self.assertIn('可继续处理：0 张', output.getvalue())
+        open_folder.assert_not_called()
+        prompt.assert_not_called()
+
     def test_import_reactivates_after_confirmation_and_records_attempts(self):
         args = self.prepare_import('win32')
         events = []
